@@ -520,7 +520,35 @@ app.get("/", (req, res) =>
   res.json({ status: "ok", service: "EdgeBet AI API", agents: 7, aiTokenCost: "$0", version: "2.0.0" })
 );
 
-// POST /scan — full 7-agent algorithmic pipeline, zero AI token cost
+// GET /scan — full 7-agent algorithmic pipeline, zero AI token cost
+app.get("/scan", async (req, res) => {
+  try {
+    const oddsResults = await Promise.all(
+      SPORTS.map((s) =>
+        fetchSportOdds(s.key).then((games) =>
+          games.slice(0, 8).map((g) => parseGame(g, s.label, s.emoji))
+        )
+      )
+    );
+
+    const allGames = oddsResults.flat();
+    if (allGames.length === 0) {
+      return res.status(503).json({
+        error: "No odds data available",
+        hint: "Set ODDS_API_KEY or no games are currently scheduled",
+      });
+    }
+
+    const result = agentConsensus(allGames);
+    console.log(`Scan: ${result.consensus_picks.length} picks from ${allGames.length} games`);
+    res.json(result);
+  } catch (err) {
+    console.error("Scan error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /scan — same as GET for compatibility
 app.post("/scan", async (req, res) => {
   try {
     const oddsResults = await Promise.all(
