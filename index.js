@@ -6,7 +6,7 @@ const app = express();
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }));
 app.use(express.json());
 
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const ODDS_API_KEY = process.env.ODDS_API_KEY || "316ba9e3bd49f1c65f604a292e1962a8";
 const ODDS_BASE = "https://api.the-odds-api.com/v4";
 
 // Debug: Log if key is present (don't log the actual key!)
