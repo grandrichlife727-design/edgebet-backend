@@ -2,10 +2,15 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const Redis = require("redis");
+const Stripe = require("stripe");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }));
 app.use(express.json());
+
+// Initialize Stripe
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // Redis client
 const redis = Redis.createClient({
@@ -13,561 +18,517 @@ const redis = Redis.createClient({
 });
 redis.connect().catch(console.error);
 
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const SPORTSDATA_API_KEY = process.env.SPORTSDATA_API_KEY;
-const WEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
-const ODDS_BASE = "https://api.the-odds-api.com/v4";
-const SPORTSDATA_BASE = "https://api.sportsdata.io/v3";
+// OAuth Config
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID;
+const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET;
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://grandrichlife727-design.github.io/edgebet-ai";
 
-console.log("API Keys present:", {
-  odds: !!ODDS_API_KEY,
-  sportsdata: !!SPORTSDATA_API_KEY,
-  weather: !!WEATHER_API_KEY
-});
+// Membership Tiers
+const TIERS = {
+  FREE: {
+    name: 'Free',
+    picksPerDay: 2,
+    features: ['basic_picks', 'ev_calculator', 'journal'],
+    price: 0,
+    stripePriceId: null
+  },
+  PRO: {
+    name: 'Pro',
+    picksPerDay: 999,
+    features: ['all_picks', 'ev_calculator', 'parlay_builder', 'line_shopping', 'journal', 'steam_moves', 'analytics'],
+    price: 1999,
+    stripePriceId: process.env.STRIPE_PRICE_PRO
+  },
+  SHARP: {
+    name: 'Sharp',
+    picksPerDay: 999,
+    features: ['all_picks', 'ev_calculator', 'parlay_builder', 'line_shopping', 'journal', 'steam_moves', 'analytics', 'weather', 'arb_alerts', 'discord_access', 'priority_support'],
+    price: 4999,
+    stripePriceId: process.env.STRIPE_PRICE_SHARP
+  }
+};
 
 // Data stores
 const users = new Map();
-const pickHistory = [];
-const steamMoves = []; // Track rapid line movements
-const journalEntries = new Map(); // userId -> entries
+const oauthStates = new Map();
 
-const SPORTS = [
-  { key: "basketball_nba", label: "NBA", emoji: "🏀", sportsdataSport: "nba", hasWeather: false },
-  { key: "americanfootball_nfl", label: "NFL", emoji: "🏈", sportsdataSport: "nfl", hasWeather: true },
-  { key: "icehockey_nhl", label: "NHL", emoji: "🏒", sportsdataSport: "nhl", hasWeather: false },
-  { key: "basketball_ncaab", label: "NCAAB", emoji: "🎓", sportsdataSport: null, hasWeather: false },
-  { key: "baseball_mlb", label: "MLB", emoji: "⚾", sportsdataSport: "mlb", hasWeather: true },
-];
-
-const PROP_MARKETS = {
-  basketball_nba: ["player_points", "player_rebounds", "player_assists", "player_threes"],
-  americanfootball_nfl: ["player_pass_tds", "player_pass_yds", "player_rush_yds", "player_receptions"],
-  icehockey_nhl: ["player_goals", "player_assists", "player_points"],
-  baseball_mlb: ["player_hits", "player_runs", "player_rbis", "player_home_runs"],
-};
-
-const SHARP_BOOKS = new Set(["pinnacle", "betcris", "betonlineag", "bovada", "lowvig"]);
-const ALL_BOOKS = ["fanduel", "draftkings", "betmgm", "caesars", "pointsbet", "wynnbet", "barstool", "pinnacle", "betcris"];
-
-// ── CACHE UTILS ───────────────────────────────────────────────────────────────
-async function getCache(key) {
-  try {
-    const val = await redis.get(key);
-    return val ? JSON.parse(val) : null;
-  } catch { return null; }
+// ── MIDDLEWARE ────────────────────────────────────────────────────────────────
+async function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'No token' });
+  
+  const userId = token.replace('token_', '');
+  const user = users.get(userId);
+  if (!user) return res.status(401).json({ error: 'Invalid token' });
+  
+  req.user = user;
+  next();
 }
 
-async function setCache(key, value, ttl = 300) {
-  try {
-    await redis.setEx(key, ttl, JSON.stringify(value));
-  } catch {}
-}
+// ── GOOGLE OAUTH ──────────────────────────────────────────────────────────────
+app.get('/auth/google/url', (req, res) => {
+  if (!GOOGLE_CLIENT_ID) {
+    return res.status(500).json({ error: 'Google OAuth not configured' });
+  }
+  
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates.set(state, { provider: 'google', createdAt: Date.now() });
+  
+  // Clean old states after 10 minutes
+  setTimeout(() => oauthStates.delete(state), 600000);
+  
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: `${req.protocol}://${req.get('host')}/auth/google/callback`,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state: state,
+    prompt: 'select_account'
+  });
+  
+  res.json({
+    url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`,
+    state
+  });
+});
 
-// ── MATH UTILS ────────────────────────────────────────────────────────────────
-const impliedProb = (odds) => odds > 0 ? 100 / (odds + 100) : Math.abs(odds) / (Math.abs(odds) + 100);
-const decimalOdds = (american) => american > 0 ? (american / 100) + 1 : (100 / Math.abs(american)) + 1;
-const kellyStake = (bankroll, edgePercent, oddsDecimal) => {
-  const p = (edgePercent / 100) + (1 / oddsDecimal);
-  const q = 1 - p;
-  const kelly = (p * oddsDecimal - q) / oddsDecimal;
-  return bankroll * Math.max(0, kelly);
-};
-
-const fmtOdds = (n) => (n > 0 ? `+${n}` : `${n}`);
-const avg = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
-
-// ── EXTERNAL APIS ─────────────────────────────────────────────────────────────
-async function fetchWeather(city, date) {
-  if (!WEATHER_API_KEY || !city) return null;
-  const cacheKey = `weather:${city}:${date}`;
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
+app.get('/auth/google/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  
+  if (error) {
+    return res.redirect(`${FRONTEND_URL}/?auth=error&message=${encodeURIComponent(error)}`);
+  }
+  
+  if (!oauthStates.has(state)) {
+    return res.redirect(`${FRONTEND_URL}/?auth=error&message=Invalid state`);
+  }
+  
+  oauthStates.delete(state);
   
   try {
-    const url = `https://api.openweathermap.org/data/2.5/forecast?q=${encodeURIComponent(city)}&appid=${WEATHER_API_KEY}&units=imperial`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return null;
-    const data = await res.json();
+    // Exchange code for tokens
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id: GOOGLE_CLIENT_ID,
+        client_secret: GOOGLE_CLIENT_SECRET,
+        redirect_uri: `${req.protocol}://${req.get('host')}/auth/google/callback`,
+        grant_type: 'authorization_code'
+      })
+    });
     
-    // Find forecast closest to game time
-    const forecast = data.list?.[0];
-    if (!forecast) return null;
+    const tokenData = await tokenRes.json();
     
-    const result = {
-      temp: Math.round(forecast.main.temp),
-      wind: Math.round(forecast.wind.speed),
-      rain: forecast.weather?.[0]?.main?.toLowerCase().includes('rain'),
-      snow: forecast.weather?.[0]?.main?.toLowerCase().includes('snow'),
-      description: forecast.weather?.[0]?.description,
-      impact: 'none'
-    };
+    if (!tokenRes.ok) {
+      throw new Error(tokenData.error_description || 'Token exchange failed');
+    }
     
-    // Calculate weather impact
-    if (result.wind > 15) result.impact = 'high';
-    else if (result.wind > 10 || result.rain) result.impact = 'medium';
+    // Get user info
+    const userRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
     
-    await setCache(cacheKey, result, 1800);
-    return result;
-  } catch (e) { return null; }
-}
-
-async function fetchInjuries(sport) {
-  if (!SPORTSDATA_API_KEY || !sport) return [];
-  const cacheKey = `injuries:${sport}`;
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
-  
-  try {
-    const url = `${SPORTSDATA_BASE}/${sport}/scores/json/InjuriesByTeam?key=${SPORTSDATA_API_KEY}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return [];
-    const data = await res.json();
+    const googleUser = await userRes.json();
     
-    const injuries = [];
-    for (const team of data || []) {
-      for (const inj of team.Injuries || []) {
-        injuries.push({
-          player: inj.Name,
-          team: team.Name,
-          status: inj.Status,
-          injury: inj.Injury,
-          position: inj.Position,
-          lastUpdate: inj.Updated,
+    // Find or create user
+    let user = Array.from(users.values()).find(u => u.email === googleUser.email);
+    
+    if (!user) {
+      const userId = `user_google_${Date.now()}`;
+      user = {
+        id: userId,
+        email: googleUser.email,
+        name: googleUser.name,
+        picture: googleUser.picture,
+        provider: 'google',
+        tier: 'FREE',
+        picksToday: 0,
+        picksResetAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        onboardingCompleted: false
+      };
+      users.set(userId, user);
+      
+      // Create Stripe customer
+      try {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: user.name,
+          metadata: { provider: 'google' }
         });
+        user.stripeCustomerId = customer.id;
+      } catch (e) {
+        console.error('Stripe customer creation failed:', e.message);
       }
     }
-    await setCache(cacheKey, injuries, 600);
-    return injuries;
-  } catch (e) { return []; }
-}
+    
+    // Generate token
+    const token = `token_${user.id}`;
+    
+    // Redirect to frontend with token
+    res.redirect(`${FRONTEND_URL}/?auth=success&token=${token}&userId=${user.id}&email=${encodeURIComponent(user.email)}&onboarding=${!user.onboardingCompleted}`);
+    
+  } catch (e) {
+    console.error('Google auth error:', e);
+    res.redirect(`${FRONTEND_URL}/?auth=error&message=${encodeURIComponent(e.message)}`);
+  }
+});
 
-async function fetchSportOdds(sportKey, markets = "spreads,totals,h2h", region = "us") {
-  const cacheKey = `odds:${sportKey}:${markets}:${region}`;
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
+// ── FACEBOOK OAUTH ───────────────────────────────────────────────────────────
+app.get('/auth/facebook/url', (req, res) => {
+  if (!FACEBOOK_APP_ID) {
+    return res.status(500).json({ error: 'Facebook OAuth not configured' });
+  }
   
-  if (!ODDS_API_KEY) return [];
-  const url = new URL(`${ODDS_BASE}/sports/${sportKey}/odds`);
-  url.searchParams.set("apiKey", ODDS_API_KEY);
-  url.searchParams.set("regions", region);
-  url.searchParams.set("markets", markets);
-  url.searchParams.set("oddsFormat", "american");
+  const state = crypto.randomBytes(16).toString('hex');
+  oauthStates.set(state, { provider: 'facebook', createdAt: Date.now() });
+  
+  setTimeout(() => oauthStates.delete(state), 600000);
+  
+  const params = new URLSearchParams({
+    client_id: FACEBOOK_APP_ID,
+    redirect_uri: `${req.protocol}://${req.get('host')}/auth/facebook/callback`,
+    response_type: 'code',
+    scope: 'email,public_profile',
+    state: state
+  });
+  
+  res.json({
+    url: `https://www.facebook.com/v18.0/dialog/oauth?${params.toString()}`,
+    state
+  });
+});
+
+app.get('/auth/facebook/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+  
+  if (error) {
+    return res.redirect(`${FRONTEND_URL}/?auth=error&message=${encodeURIComponent(error)}`);
+  }
+  
+  if (!oauthStates.has(state)) {
+    return res.redirect(`${FRONTEND_URL}/?auth=error&message=Invalid state`);
+  }
+  
+  oauthStates.delete(state);
   
   try {
-    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(8000) });
-    if (!res.ok) return [];
-    const data = await res.json();
-    await setCache(cacheKey, data, 60);
-    return data;
-  } catch (e) { return []; }
-}
+    // Exchange code for token
+    const tokenRes = await fetch('https://graph.facebook.com/v18.0/oauth/access_token', {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    const tokenUrl = `https://graph.facebook.com/v18.0/oauth/access_token?${new URLSearchParams({
+      client_id: FACEBOOK_APP_ID,
+      client_secret: FACEBOOK_APP_SECRET,
+      redirect_uri: `${req.protocol}://${req.get('host')}/auth/facebook/callback`,
+      code
+    })}`;
+    
+    const tokenData = await (await fetch(tokenUrl)).json();
+    
+    if (tokenData.error) {
+      throw new Error(tokenData.error.message);
+    }
+    
+    // Get user info
+    const userRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${tokenData.access_token}`);
+    const fbUser = await userRes.json();
+    
+    // Find or create user
+    let user = Array.from(users.values()).find(u => u.email === fbUser.email);
+    
+    if (!user) {
+      const userId = `user_facebook_${Date.now()}`;
+      user = {
+        id: userId,
+        email: fbUser.email,
+        name: fbUser.name,
+        picture: fbUser.picture?.data?.url,
+        provider: 'facebook',
+        tier: 'FREE',
+        picksToday: 0,
+        picksResetAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        onboardingCompleted: false
+      };
+      users.set(userId, user);
+      
+      try {
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name: user.name,
+          metadata: { provider: 'facebook' }
+        });
+        user.stripeCustomerId = customer.id;
+      } catch (e) {
+        console.error('Stripe customer creation failed:', e.message);
+      }
+    }
+    
+    const token = `token_${user.id}`;
+    
+    res.redirect(`${FRONTEND_URL}/?auth=success&token=${token}&userId=${user.id}&email=${encodeURIComponent(user.email)}&onboarding=${!user.onboardingCompleted}`);
+    
+  } catch (e) {
+    console.error('Facebook auth error:', e);
+    res.redirect(`${FRONTEND_URL}/?auth=error&message=${encodeURIComponent(e.message)}`);
+  }
+});
 
-// ── LINE SHOPPING ─────────────────────────────────────────────────────────────
-async function getLineShopping(gameId, sportKey) {
-  const cacheKey = `lineshop:${gameId}`;
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
+// ── EMAIL/PASSWORD AUTH ──────────────────────────────────────────────────────
+app.post('/auth/register', async (req, res) => {
+  const { email, password, name } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
   
-  const games = await fetchSportOdds(sportKey, "spreads,totals,h2h", "us,eu,uk");
-  const game = games.find(g => 
-    `${g.away_team}_${g.home_team}`.replace(/\s/g, '_') === gameId
+  // Check if email exists
+  const existing = Array.from(users.values()).find(u => u.email === email);
+  if (existing) {
+    return res.status(409).json({ error: 'Email already registered' });
+  }
+  
+  const userId = `user_${Date.now()}`;
+  const user = {
+    id: userId,
+    email,
+    name: name || email.split('@')[0],
+    password: password, // Hash in production!
+    provider: 'email',
+    tier: 'FREE',
+    picksToday: 0,
+    picksResetAt: new Date().toISOString(),
+    createdAt: new Date().toISOString(),
+    onboardingCompleted: false
+  };
+  
+  users.set(userId, user);
+  
+  try {
+    const customer = await stripe.customers.create({ email, name: user.name });
+    user.stripeCustomerId = customer.id;
+  } catch (e) {
+    console.error('Stripe customer creation failed:', e.message);
+  }
+  
+  res.json({
+    userId,
+    email,
+    token: `token_${userId}`,
+    tier: 'FREE',
+    onboardingRequired: true
+  });
+});
+
+app.post('/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  const user = Array.from(users.values()).find(u => 
+    u.email === email && u.password === password
   );
   
-  if (!game) return null;
-  
-  const lines = { spreads: {}, totals: {}, moneyline: {} };
-  
-  for (const book of game.bookmakers || []) {
-    for (const market of book.markets) {
-      if (market.key === 'spreads') {
-        const home = market.outcomes.find(o => o.name === g.home_team);
-        const away = market.outcomes.find(o => o.name === g.away_team);
-        if (home && away) {
-          lines.spreads[book.key] = { home: home.point, away: away.point, homePrice: home.price, awayPrice: away.price };
-        }
-      }
-      if (market.key === 'totals') {
-        const over = market.outcomes.find(o => o.name === 'Over');
-        if (over) {
-          lines.totals[book.key] = { line: over.point, overPrice: over.price, underPrice: market.outcomes.find(o => o.name === 'Under')?.price };
-        }
-      }
-      if (market.key === 'h2h') {
-        const home = market.outcomes.find(o => o.name === g.home_team);
-        const away = market.outcomes.find(o => o.name === g.away_team);
-        if (home && away) {
-          lines.moneyline[book.key] = { home: home.price, away: away.price };
-        }
-      }
-    }
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
   }
   
-  // Find best lines
-  const bestSpreads = { home: null, away: null };
-  const bestTotals = { over: null, under: null };
-  const bestML = { home: null, away: null };
-  
-  for (const [book, line] of Object.entries(lines.spreads)) {
-    if (!bestSpreads.home || line.homePrice > bestSpreads.home.price) {
-      bestSpreads.home = { book, point: line.home, price: line.homePrice };
-    }
-    if (!bestSpreads.away || line.awayPrice > bestSpreads.away.price) {
-      bestSpreads.away = { book, point: line.away, price: line.awayPrice };
-    }
-  }
-  
-  await setCache(cacheKey, { lines, best: { spreads: bestSpreads, totals: bestTotals, moneyline: bestML } }, 120);
-  return { lines, best: { spreads: bestSpreads, totals: bestTotals, moneyline: bestML } };
-}
-
-// ── STEAM MOVE DETECTION ──────────────────────────────────────────────────────
-async function detectSteamMoves(sportKey) {
-  const currentOdds = await fetchSportOdds(sportKey);
-  const moves = [];
-  
-  for (const game of currentOdds) {
-    const gameId = `${sportKey}_${game.away_team}_${game.home_team}`.replace(/\s/g, '_');
-    const previous = await getCache(`odds_prev:${gameId}`);
-    
-    if (previous) {
-      // Compare current vs previous
-      for (const book of game.bookmakers || []) {
-        const prevBook = previous.bookmakers?.find(b => b.key === book.key);
-        if (!prevBook) continue;
-        
-        for (const market of book.markets) {
-          const prevMarket = prevBook.markets?.find(m => m.key === market.key);
-          if (!prevMarket) continue;
-          
-          for (const outcome of market.outcomes) {
-            const prevOutcome = prevMarket.outcomes?.find(o => o.name === outcome.name);
-            if (!prevOutcome) continue;
-            
-            const pointDiff = (outcome.point || 0) - (prevOutcome.point || 0);
-            const priceDiff = outcome.price - prevOutcome.price;
-            
-            if (Math.abs(pointDiff) >= 1 || Math.abs(priceDiff) >= 20) {
-              moves.push({
-                game: `${game.away_team} @ ${game.home_team}`,
-                book: book.key,
-                market: market.key,
-                side: outcome.name,
-                pointChange: pointDiff,
-                priceChange: priceDiff,
-                oldLine: prevOutcome.point || prevOutcome.price,
-                newLine: outcome.point || outcome.price,
-                timestamp: new Date().toISOString(),
-                steam: Math.abs(pointDiff) >= 2 || Math.abs(priceDiff) >= 50
-              });
-            }
-          }
-        }
-      }
-    }
-    
-    // Store current for next comparison
-    await setCache(`odds_prev:${gameId}`, game, 300);
-  }
-  
-  return moves.sort((a, b) => Math.abs(b.priceChange) - Math.abs(a.priceChange));
-}
-
-// ── EV CALCULATOR ─────────────────────────────────────────────────────────────
-function calculateEV(trueProbPercent, oddsAmerican, bankroll = 1000, kellyFraction = 0.25) {
-  const trueProb = trueProbPercent / 100;
-  const oddsDecimal = decimalOdds(oddsAmerican);
-  const implied = impliedProb(oddsAmerican) / 100;
-  
-  // EV calculation
-  const winAmount = oddsDecimal - 1;
-  const ev = (trueProb * winAmount) - ((1 - trueProb) * 1);
-  const evPercent = ev * 100;
-  
-  // Edge
-  const edge = (trueProb - implied) * 100;
-  
-  // Kelly stake
-  const fullKelly = kellyStake(bankroll, edge, oddsDecimal);
-  const recommendedStake = fullKelly * kellyFraction;
-  
-  // Breakeven probability
-  const breakeven = 1 / oddsDecimal * 100;
-  
-  return {
-    ev: evPercent.toFixed(2),
-    edge: edge.toFixed(2),
-    impliedProbability: (implied * 100).toFixed(1),
-    trueProbability: trueProbPercent.toFixed(1),
-    breakevenProbability: breakeven.toFixed(1),
-    recommendedStake: Math.round(recommendedStake),
-    kellyPercent: ((recommendedStake / bankroll) * 100).toFixed(2),
-    isPositive: ev > 0,
-    rating: ev > 0.05 ? 'A' : ev > 0.02 ? 'B' : ev > 0 ? 'C' : 'F'
-  };
-}
-
-// ── PARLAY CALCULATOR ─────────────────────────────────────────────────────────
-function calculateParlay(legs) {
-  let totalDecimalOdds = 1;
-  let totalTrueProb = 1;
-  let totalEdge = 0;
-  
-  for (const leg of legs) {
-    const decimal = decimalOdds(leg.odds);
-    totalDecimalOdds *= decimal;
-    totalTrueProb *= (leg.trueProb / 100);
-    totalEdge += parseFloat(leg.edge || 0);
-  }
-  
-  // Parlay American odds
-  const parlayAmerican = totalDecimalOdds > 2 
-    ? Math.round((totalDecimalOdds - 1) * 100)
-    : Math.round(-100 / (totalDecimalOdds - 1));
-  
-  // Parlay true probability and EV
-  const parlayImplied = 1 / totalDecimalOdds;
-  const parlayEV = ((totalTrueProb / parlayImplied) - 1) * 100;
-  
-  return {
-    legs: legs.length,
-    decimalOdds: totalDecimalOdds.toFixed(3),
-    americanOdds: fmtOdds(parlayAmerican),
-    impliedProbability: (parlayImplied * 100).toFixed(2),
-    trueProbability: (totalTrueProb * 100).toFixed(2),
-    ev: parlayEV.toFixed(2),
-    avgEdge: (totalEdge / legs.length).toFixed(2),
-    isPositive: parlayEV > 0,
-    stake: legs.length >= 2 && legs.length <= 3 ? 'Recommended' : legs.length > 4 ? 'High Variance' : 'Select 2-3 legs'
-  };
-}
-
-// ── MLB/NFL ADVANCED STATS ───────────────────────────────────────────────────
-async function getMLBPitcherStats() {
-  if (!SPORTSDATA_API_KEY) return [];
-  const cacheKey = 'mlb_pitchers';
-  const cached = await getCache(cacheKey);
-  if (cached) return cached;
-  
-  try {
-    const url = `${SPORTSDATA_BASE}/mlb/stats/json/PlayerSeasonStats/2024?key=${SPORTSDATA_API_KEY}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!res.ok) return [];
-    const data = await res.json();
-    
-    const pitchers = data
-      .filter(p => p.Position === 'SP' && p.InningsPitchedDecimal > 20)
-      .map(p => ({
-        name: p.Name,
-        team: p.Team,
-        era: p.EarnedRunAverage,
-        whip: p.WalksHitsPerInningsPitched,
-        kPerNine: p.StrikeoutsPerNineInnings,
-        bbPerNine: p.WalksPerNineInnings,
-        fip: (p.EarnedRunAverage * 0.9 + p.WalksHitsPerInningsPitched * 2).toFixed(2), // Simplified FIP
-        recentForm: p.StrikeoutsPerNineInnings > 9 ? 'hot' : p.EarnedRunAverage < 3.5 ? 'solid' : 'cold'
-      }))
-      .sort((a, b) => a.era - b.era);
-    
-    await setCache(cacheKey, pitchers, 3600);
-    return pitchers.slice(0, 50);
-  } catch (e) { return []; }
-}
-
-async function getNBARestAdvantage() {
-  // Simplified rest analysis
-  const games = await fetchSportOdds('basketball_nba');
-  const restAnalysis = [];
-  
-  for (const game of games) {
-    // In real implementation, fetch schedule data
-    // For now, return placeholder structure
-    restAnalysis.push({
-      game: `${game.away_team} @ ${game.home_team}`,
-      awayRest: 2, // days
-      homeRest: 1,
-      advantage: 'home', // team with more rest
-      impact: 'medium' // high if 3+ days diff
-    });
-  }
-  
-  return restAnalysis;
-}
-
-// ── ROUTES ────────────────────────────────────────────────────────────────────
-app.get("/", (req, res) =>
-  res.json({ 
-    status: "ok", 
-    service: "EdgeBet AI API v4.0",
-    features: ["picks", "props", "arbitrage", "ev-calculator", "parlay-builder", "line-shopping", "steam-moves", "weather", "analytics", "journal"],
-    version: "4.0.0"
-  })
-);
-
-// EV Calculator endpoint
-app.post("/ev-calculator", (req, res) => {
-  const { trueProbability, odds, bankroll = 1000, kellyFraction = 0.25 } = req.body;
-  if (!trueProbability || !odds) {
-    return res.status(400).json({ error: "trueProbability and odds required" });
-  }
-  
-  const result = calculateEV(trueProbability, odds, bankroll, kellyFraction);
-  res.json(result);
-});
-
-// Parlay Calculator endpoint
-app.post("/parlay-calculator", (req, res) => {
-  const { legs } = req.body;
-  if (!legs || !Array.isArray(legs) || legs.length < 2) {
-    return res.status(400).json({ error: "At least 2 legs required" });
-  }
-  
-  const result = calculateParlay(legs);
-  res.json(result);
-});
-
-// Line Shopping endpoint
-app.get("/line-shopping/:sport/:gameId", async (req, res) => {
-  const { sport, gameId } = req.params;
-  const result = await getLineShopping(gameId, `basketball_${sport.toLowerCase()}`);
-  if (!result) return res.status(404).json({ error: "Game not found" });
-  res.json(result);
-});
-
-// Steam Moves endpoint
-app.get("/steam-moves/:sport", async (req, res) => {
-  const sport = req.params.sport;
-  const moves = await detectSteamMoves(`${sport}`);
-  res.json({ moves: moves.slice(0, 20), count: moves.length, timestamp: new Date().toISOString() });
-});
-
-// Weather endpoint
-app.get("/weather/:city", async (req, res) => {
-  const city = req.params.city;
-  const forecast = await fetchWeather(city);
-  if (!forecast) return res.status(404).json({ error: "Weather data unavailable" });
-  res.json(forecast);
-});
-
-// MLB Pitcher Stats endpoint
-app.get("/mlb/pitchers", async (req, res) => {
-  const pitchers = await getMLBPitcherStats();
-  res.json({ pitchers, count: pitchers.length });
-});
-
-// NBA Rest endpoint
-app.get("/nba/rest", async (req, res) => {
-  const restData = await getNBARestAdvantage();
-  res.json({ games: restData });
-});
-
-// Betting Journal endpoints
-app.post("/journal/:userId", async (req, res) => {
-  const { userId } = req.params;
-  const entry = { ...req.body, id: Date.now(), createdAt: new Date().toISOString() };
-  
-  if (!journalEntries.has(userId)) {
-    journalEntries.set(userId, []);
-  }
-  journalEntries.get(userId).push(entry);
-  
-  res.json({ success: true, entry });
-});
-
-app.get("/journal/:userId", async (req, res) => {
-  const { userId } = req.params;
-  const entries = journalEntries.get(userId) || [];
-  res.json({ entries, count: entries.length });
-});
-
-// Trending picks (what users are tracking)
-app.get("/trending", async (req, res) => {
-  // Aggregate from pick history
-  const pickCounts = {};
-  for (const pick of pickHistory.slice(-100)) {
-    const key = `${pick.game}_${pick.bet}`;
-    pickCounts[key] = (pickCounts[key] || 0) + 1;
-  }
-  
-  const trending = Object.entries(pickCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([key, count]) => ({ pick: key, trackerCount: count }));
-  
-  res.json({ trending, lastUpdated: new Date().toISOString() });
-});
-
-// Closing Line Value endpoint
-app.get("/clv/:pickId", async (req, res) => {
-  const pick = pickHistory.find(p => p.id === req.params.pickId);
-  if (!pick) return res.status(404).json({ error: "Pick not found" });
-  
-  // In real implementation, compare to closing line
-  // For now return placeholder
   res.json({
-    pick: pick.bet,
-    openingLine: pick.openingLine,
-    closingLine: pick.currentLine,
-    clv: 0.5, // points of value
-    positive: true
+    userId: user.id,
+    email: user.email,
+    name: user.name,
+    picture: user.picture,
+    token: `token_${user.id}`,
+    tier: user.tier,
+    onboardingCompleted: user.onboardingCompleted
   });
 });
 
-// Main scan endpoint (enhanced)
-app.get("/scan", async (req, res) => {
+// ── TIER & SUBSCRIPTION ──────────────────────────────────────────────────────
+async function getUserTier(userId) {
+  const user = users.get(userId);
+  if (!user) return 'FREE';
+  
+  if (user.subscriptionId && user.subscriptionStatus === 'active') {
+    if (user.subscriptionCurrentPeriodEnd && new Date(user.subscriptionCurrentPeriodEnd) > new Date()) {
+      return user.tier;
+    }
+  }
+  
+  return 'FREE';
+}
+
+app.get('/tier/status', authMiddleware, async (req, res) => {
+  const tier = await getUserTier(req.user.id);
+  const tierConfig = TIERS[tier.toUpperCase()];
+  
+  res.json({
+    tier,
+    features: tierConfig.features,
+    picksPerDay: tierConfig.picksPerDay,
+    picksUsedToday: req.user.picksToday || 0,
+    picksRemaining: tierConfig.picksPerDay - (req.user.picksToday || 0),
+    price: tierConfig.price,
+    canUpgrade: tier !== 'SHARP',
+    trialAvailable: !req.user.trialUsed
+  });
+});
+
+// ── STRIPE CHECKOUT ───────────────────────────────────────────────────────────
+app.post('/stripe/checkout', authMiddleware, async (req, res) => {
+  const { tier } = req.body;
+  const tierConfig = TIERS[tier.toUpperCase()];
+  
+  if (!tierConfig || tier === 'FREE' || !tierConfig.stripePriceId) {
+    return res.status(400).json({ error: 'Invalid tier' });
+  }
+  
   try {
-    const oddsResults = await Promise.all(
-      SPORTS.map(s => fetchSportOdds(s.key).then(games => games.slice(0, 8)))
-    );
+    const user = req.user;
     
-    const allGames = oddsResults.flat();
-    if (allGames.length === 0) {
-      return res.status(503).json({ error: "No odds data available" });
+    const sessionConfig = {
+      customer: user.stripeCustomerId,
+      payment_method_types: ['card'],
+      line_items: [{
+        price: tierConfig.stripePriceId,
+        quantity: 1
+      }],
+      mode: 'subscription',
+      success_url: `${FRONTEND_URL}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/cancel`
+    };
+    
+    // Add trial for new subscribers
+    if (!user.trialUsed) {
+      sessionConfig.subscription_data = {
+        trial_period_days: 7
+      };
     }
     
-    // Process games (simplified - full implementation would include all 7 agents)
-    const picks = allGames.slice(0, 5).map((g, i) => ({
-      id: `pick_${Date.now()}_${i}`,
-      sport: g.sport_title,
-      game: `${g.away_team} @ ${g.home_team}`,
-      bet: `${g.home_team} -4.5`,
-      odds: '-110',
-      confidence: 65 + Math.floor(Math.random() * 20),
-      edge: (3 + Math.random() * 8).toFixed(1),
-      timestamp: new Date().toISOString()
-    }));
+    const session = await stripe.checkout.sessions.create(sessionConfig);
     
-    // Check for steam moves
-    const steamMoves = await detectSteamMoves('basketball_nba');
-    
-    res.json({ 
-      consensus_picks: picks,
-      steam_moves: steamMoves.slice(0, 5),
-      arbitrage_opportunities: [],
-      scan_time: new Date().toISOString()
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Affiliate links
-app.get("/affiliate/:book", (req, res) => {
-  const links = {
-    fanduel: 'https://sportsbook.fanduel.com/?ref=edgebet',
-    draftkings: 'https://sportsbook.draftkings.com/?ref=edgebet',
-    betmgm: 'https://sports.betmgm.com/?ref=edgebet',
-    caesars: 'https://sportsbook.caesars.com/?ref=edgebet'
-  };
+// Stripe webhook
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
   
-  const book = req.params.book.toLowerCase();
-  res.json({ 
-    book, 
-    url: links[book] || `https://${book}.com`,
-    bonus: '$1000 Risk-Free Bet'
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+  
+  switch (event.type) {
+    case 'checkout.session.completed':
+      const session = event.data.object;
+      const user = Array.from(users.values()).find(u => u.stripeCustomerId === session.customer);
+      
+      if (user) {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        const priceId = subscription.items.data[0].price.id;
+        
+        const tier = priceId === TIERS.PRO.stripePriceId ? 'PRO' : 
+                     priceId === TIERS.SHARP.stripePriceId ? 'SHARP' : 'FREE';
+        
+        user.subscriptionId = session.subscription;
+        user.subscriptionStatus = 'active';
+        user.subscriptionCurrentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
+        user.tier = tier;
+        user.trialUsed = true;
+        
+        // Notify Discord
+        if (process.env.DISCORD_WEBHOOK_URL) {
+          await fetch(process.env.DISCORD_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              content: `🎉 New ${tier} subscriber: ${user.email} (${user.provider || 'email'})`
+            })
+          });
+        }
+      }
+      break;
+      
+    case 'invoice.payment_failed':
+      const sub = event.data.object;
+      const failedUser = Array.from(users.values()).find(u => u.subscriptionId === sub.id);
+      if (failedUser) {
+        failedUser.tier = 'FREE';
+        failedUser.subscriptionStatus = 'past_due';
+      }
+      break;
+  }
+  
+  res.json({ received: true });
+});
+
+// ── PICKS (WITH LIMITS) ───────────────────────────────────────────────────────
+app.get('/scan', authMiddleware, async (req, res) => {
+  const user = req.user;
+  const tier = await getUserTier(user.id);
+  const tierConfig = TIERS[tier.toUpperCase()];
+  
+  // Reset daily counter if needed
+  const lastReset = new Date(user.picksResetAt || 0);
+  const now = new Date();
+  if (lastReset.getDate() !== now.getDate() || lastReset.getMonth() !== now.getMonth()) {
+    user.picksToday = 0;
+    user.picksResetAt = now.toISOString();
+  }
+  
+  if (user.picksToday >= tierConfig.picksPerDay) {
+    return res.status(403).json({
+      error: 'Daily pick limit reached',
+      limit: tierConfig.picksPerDay,
+      used: user.picksToday,
+      upgradeUrl: '/upgrade',
+      message: tier === 'FREE' ? 'Upgrade to Pro for unlimited picks' : 'Daily limit reached'
+    });
+  }
+  
+  user.picksToday++;
+  
+  // Return mock picks (integrate real odds API in production)
+  res.json({
+    picks: [
+      { id: 1, bet: 'Lakers -4.5', odds: '-110', edge: 5.2, confidence: 72, sport: 'NBA' },
+      { id: 2, bet: 'Chiefs ML', odds: '+150', edge: 3.8, confidence: 65, sport: 'NFL' }
+    ],
+    remainingPicks: tierConfig.picksPerDay - user.picksToday
   });
 });
+
+// ── ONBOARDING ─────────────────────────────────────────────────────────────────
+app.post('/onboarding/complete', authMiddleware, (req, res) => {
+  const user = req.user;
+  user.onboardingCompleted = true;
+  user.preferences = req.body;
+  res.json({ success: true });
+});
+
+// ── BASE ───────────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({
+  status: 'ok',
+  service: 'EdgeBet AI v5.1',
+  features: ['google_oauth', 'facebook_oauth', 'email_auth', 'tiers', 'subscriptions'],
+  oauth: {
+    google: !!GOOGLE_CLIENT_ID,
+    facebook: !!FACEBOOK_APP_ID
+  },
+  version: '5.1.0'
+}));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () =>
-  console.log(`EdgeBet AI API v4.0 on :${PORT} — EV Calculator, Parlay Builder, Steam Moves, Weather`)
-);
+app.listen(PORT, () => {
+  console.log(`EdgeBet AI v5.1 on :${PORT}`);
+  console.log(`OAuth providers: Google=${!!GOOGLE_CLIENT_ID}, Facebook=${!!FACEBOOK_APP_ID}`);
+});
