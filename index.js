@@ -9,6 +9,10 @@ app.use(express.json());
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const ODDS_BASE = "https://api.the-odds-api.com/v4";
 
+// Debug: Log if key is present (don't log the actual key!)
+console.log("ODDS_API_KEY present:", !!ODDS_API_KEY);
+console.log("ODDS_API_KEY length:", ODDS_API_KEY ? ODDS_API_KEY.length : 0);
+
 const SPORTS = [
   { key: "basketball_nba",       label: "NBA",   emoji: "🏀" },
   { key: "americanfootball_nfl", label: "NFL",   emoji: "🏈" },
