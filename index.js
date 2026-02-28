@@ -524,6 +524,16 @@ app.get("/", (req, res) =>
   res.json({ status: "ok", service: "EdgeBet AI API", agents: 7, aiTokenCost: "$0", version: "2.0.0" })
 );
 
+// Debug endpoint to check env vars
+app.get("/debug", (req, res) => {
+  res.json({
+    oddsKeyPresent: !!process.env.ODDS_API_KEY,
+    oddsKeyLength: process.env.ODDS_API_KEY ? process.env.ODDS_API_KEY.length : 0,
+    nodeEnv: process.env.NODE_ENV,
+    port: process.env.PORT
+  });
+});
+
 // GET /scan — full 7-agent algorithmic pipeline, zero AI token cost
 app.get("/scan", async (req, res) => {
   try {
