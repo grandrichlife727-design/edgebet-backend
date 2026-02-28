@@ -531,4 +531,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`EdgeBet AI v5.1 on :${PORT}`);
   console.log(`OAuth providers: Google=${!!GOOGLE_CLIENT_ID}, Facebook=${!!FACEBOOK_APP_ID}`);
+  console.log(`Stripe: ${!!process.env.STRIPE_SECRET_KEY}`);
 });
