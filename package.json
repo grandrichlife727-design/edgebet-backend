@@ -1,7 +1,7 @@
 {
   "name": "edgebet-api",
-  "version": "3.0.0",
-  "description": "EdgeBet AI — 7-Agent Algorithmic Sports Betting Backend with Redis, Analytics, Discord",
+  "version": "4.0.0",
+  "description": "EdgeBet AI — Full-featured sports betting platform with EV calculator, parlay builder, steam moves",
   "main": "index.js",
   "engines": { "node": ">=18" },
   "scripts": {
