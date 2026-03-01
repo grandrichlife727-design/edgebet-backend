@@ -515,21 +515,121 @@ app.post('/onboarding/complete', authMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// ── BET TRACKER (Redis-backed) ─────────────────────────────────────────────────
+// Key schema: bets:{userId}  →  JSON array of bet objects
+// userId = user's email address (or username for guests)
+
+const betKey = (userId) => `bets:${userId.toLowerCase().trim()}`;
+
+// GET /bets?userId=email  —  fetch all bets for a user
+app.get('/bets', async (req, res) => {
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  try {
+    const raw = await redis.get(betKey(userId));
+    const bets = raw ? JSON.parse(raw) : [];
+    res.json({ bets, count: bets.length });
+  } catch (e) {
+    console.error('GET /bets error:', e.message);
+    res.status(500).json({ error: 'Failed to fetch bets', bets: [] });
+  }
+});
+
+// POST /bets  —  save full bets array for a user (full sync)
+app.post('/bets', async (req, res) => {
+  const { userId, bets } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  if (!Array.isArray(bets)) return res.status(400).json({ error: 'bets must be an array' });
+  try {
+    await redis.set(betKey(userId), JSON.stringify(bets));
+    res.json({ success: true, count: bets.length });
+  } catch (e) {
+    console.error('POST /bets error:', e.message);
+    res.status(500).json({ error: 'Failed to save bets' });
+  }
+});
+
+// PATCH /bets/outcome  —  update a single bet's outcome without sending the full array
+app.patch('/bets/outcome', async (req, res) => {
+  const { userId, betId, outcome } = req.body;
+  if (!userId || !betId || !outcome) return res.status(400).json({ error: 'userId, betId, outcome required' });
+  const validOutcomes = ['pending', 'win', 'loss', 'push'];
+  if (!validOutcomes.includes(outcome)) return res.status(400).json({ error: `outcome must be one of: ${validOutcomes.join(', ')}` });
+  try {
+    const raw = await redis.get(betKey(userId));
+    const bets = raw ? JSON.parse(raw) : [];
+    const idx = bets.findIndex(b => String(b.id) === String(betId));
+    if (idx === -1) return res.status(404).json({ error: 'Bet not found' });
+    bets[idx].outcome = outcome;
+    bets[idx].settledAt = new Date().toISOString();
+    await redis.set(betKey(userId), JSON.stringify(bets));
+    res.json({ success: true, bet: bets[idx] });
+  } catch (e) {
+    console.error('PATCH /bets/outcome error:', e.message);
+    res.status(500).json({ error: 'Failed to update bet outcome' });
+  }
+});
+
+// DELETE /bets/:betId  —  remove a single bet
+app.delete('/bets/:betId', async (req, res) => {
+  const { userId } = req.body;
+  const { betId } = req.params;
+  if (!userId) return res.status(400).json({ error: 'userId required in body' });
+  try {
+    const raw = await redis.get(betKey(userId));
+    const bets = raw ? JSON.parse(raw) : [];
+    const filtered = bets.filter(b => String(b.id) !== String(betId));
+    await redis.set(betKey(userId), JSON.stringify(filtered));
+    res.json({ success: true, removed: bets.length - filtered.length });
+  } catch (e) {
+    console.error('DELETE /bets error:', e.message);
+    res.status(500).json({ error: 'Failed to delete bet' });
+  }
+});
+
+// ── PLAN STATUS (used by frontend plan checker) ────────────────────────────────
+app.post('/api/plan-status', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const user = Array.from(users.values()).find(u => u.email === userId || u.id === userId);
+  if (!user) return res.json({ plan: 'free', isActive: false });
+  const tier = (user.tier || 'FREE').toLowerCase();
+  const isActive = tier !== 'free' && user.subscriptionStatus === 'active';
+  res.json({ plan: tier, isActive, expiresAt: user.subscriptionCurrentPeriodEnd || null });
+});
+
+// ── STRIPE PORTAL ──────────────────────────────────────────────────────────────
+app.post('/api/create-portal-session', async (req, res) => {
+  const { userId } = req.body;
+  const user = Array.from(users.values()).find(u => u.email === userId || u.id === userId);
+  if (!user?.stripeCustomerId) return res.status(404).json({ error: 'No billing account found' });
+  try {
+    const session = await stripe.billingPortal.sessions.create({
+      customer: user.stripeCustomerId,
+      return_url: process.env.FRONTEND_URL || 'https://algobets.ai',
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── BASE ───────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  service: 'EdgeBet AI v5.1',
-  features: ['google_oauth', 'facebook_oauth', 'email_auth', 'tiers', 'subscriptions'],
+  service: 'Algobets AI v2.0',
+  features: ['google_oauth', 'facebook_oauth', 'email_auth', 'tiers', 'subscriptions', 'bet_tracker'],
   oauth: {
     google: !!GOOGLE_CLIENT_ID,
     facebook: !!FACEBOOK_APP_ID
   },
-  version: '5.1.0'
+  version: '2.0.0'
 }));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`EdgeBet AI v5.1 on :${PORT}`);
+  console.log(`Algobets AI v2.0 on :${PORT}`);
   console.log(`OAuth providers: Google=${!!GOOGLE_CLIENT_ID}, Facebook=${!!FACEBOOK_APP_ID}`);
   console.log(`Stripe: ${!!process.env.STRIPE_SECRET_KEY}`);
+  console.log(`Redis: ${process.env.REDIS_URL ? 'configured' : 'localhost fallback'}`);
 });
